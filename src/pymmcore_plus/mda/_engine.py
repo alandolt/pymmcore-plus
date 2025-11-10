@@ -539,7 +539,7 @@ class MDAEngine(PMDAEngine):
 
     # ===================== Sequenced Events =====================
 
-    def _load_sequenced_event(self, event: SequencedEvent) -> None:
+    def _load_sequenced_event(self, event: SequencedEvent, max_retry_attempts: int = 0) -> None:
         """Load a `SequencedEvent` into the core.
 
         `SequencedEvent` is a special pymmcore-plus specific subclass of
@@ -575,9 +575,31 @@ class MDAEngine(PMDAEngine):
         # set all static properties, these won't change over the course of the sequence.
         if event.properties:
             for dev, prop, value in event.properties:
-                core.setProperty(dev, prop, value)
+                for attempt in range(1, max_retry_attempts + 1):
+                    try:
+                        core.setProperty(dev, prop, value)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to set property %s.%s (attempt %d/%d): %s",
+                            dev,
+                            prop,
+                            attempt,
+                            max_retry_attempts,
+                            e,
+                        )
+                        if attempt == max_retry_attempts:
+                            logger.warning(
+                                "Giving up after %d attempts to set property %s.%s",
+                                max_retry_attempts,
+                                dev,
+                                prop,
+                            )
+                        else:
+                            time.sleep(0.1)
+                    else:
+                        break
 
-    def setup_sequenced_event(self, event: SequencedEvent) -> None:
+    def setup_sequenced_event(self, event: SequencedEvent, max_retry_attempts: int = 5) -> None:
         """Setup hardware for a sequenced (triggered) event.
 
         This method is not part of the PMDAEngine protocol (it is called by
@@ -586,14 +608,14 @@ class MDAEngine(PMDAEngine):
         """
         core = self.mmcore
 
-        self._load_sequenced_event(event)
+        self._load_sequenced_event(event, max_retry_attempts=max_retry_attempts)
 
         # this is probably not necessary.  loadSequenceEvent will have already
         # set all the config properties individually/manually.  However, without
         # the call below, we won't be able to query `core.getCurrentConfig()`
         # not sure that's necessary; and this is here for tests to pass for now,
         # but this could be removed.
-        self._set_event_channel(event)
+        self._set_event_channel(event, max_retry_attempts=max_retry_attempts)
 
         if event.slm_image:
             self._set_event_slm_image(event)
@@ -805,21 +827,36 @@ class MDAEngine(PMDAEngine):
         except Exception as e:
             logger.warning("Failed to set XY position. %s", e)
 
-    def _set_event_channel(self, event: MDAEvent) -> None:
+    def _set_event_channel(self, event: MDAEvent, max_retry_attempts: int = 0) -> None:
         if (ch := event.channel) is None:
             return
 
         # comparison with _last_config is a fast/rough check ... which may miss subtle
         # differences if device properties have been individually set in the meantime.
         # could also compare to the system state, with:
-        # data = self.mmcore.getConfigData(ch.group, ch.config)
-        # if self.mmcore.getSystemStateCache().isConfigurationIncluded(data):
+        # data = self._mmc.getConfigData(ch.group, ch.config)
+        # if self._mmc.getSystemStateCache().isConfigurationIncluded(data):
         #     ...
-        if (ch.group, ch.config) != self.mmcore._last_config:  # noqa: SLF001
-            try:
-                self.mmcore.setConfig(ch.group, ch.config)
-            except Exception as e:
-                logger.warning("Failed to set channel. %s", e)
+        if (ch.group, ch.config) != self._mmc._last_config:  # noqa: SLF001
+            # Try multiple times to set the configuration in case of transient failures.
+            for attempt in range(1, max_retry_attempts + 1):
+                try:
+                    self._mmc.setConfig(ch.group, ch.config)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to set channel (attempt %d/%d). %s",
+                        attempt,
+                        max_retry_attempts,
+                        e,
+                    )
+                    if attempt == max_retry_attempts:
+                        logger.warning(
+                            "Giving up after %d attempts to set channel.", max_retry_attempts
+                        )
+                    else:
+                        time.sleep(0.1)
+                else:
+                    break
 
     def _set_event_z(self, event: MDAEvent) -> None:
         # skip if no Z stage device is found
